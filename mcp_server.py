@@ -18,7 +18,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 # Delusionist Factory class import
-from main import DelusionistFactory
+from main import DelusionistFactory, FileLock
 
 
 # Initialize MCP server
@@ -215,8 +215,9 @@ After appending, call run_delusionist again to continue.
     # Step 3: Final
     elif step == 3:
         final_done = factory_instance.count_lines(factory_instance.section_c_path)
-        
-        if final_done >= refining_count:
+        step3_finalized = state.get("step3_finalized", False)
+
+        if step3_finalized:
             return f"""
 === ALL STEPS COMPLETE ===
 Section A (Chains): {factory_instance.section_a_path}
@@ -225,23 +226,22 @@ Section C (Final): {factory_instance.section_c_path}
 
 Use read_output_file with step="3" to view final results.
 """
-        
-        BATCH_SIZE = 5
-        remaining = refining_count - final_done
-        current_batch = min(BATCH_SIZE, remaining)
-        
+
         return f"""
 === STEP 3: FINAL CoT ===
-Progress: {final_done}/{refining_count}
+Progress: {final_done} lines appended (target: {refining_count} entries, not finalized)
 
 YOUR TASK:
 1. Read section_b_refined.txt (use read_output_file with step="2")
 2. Read the [기대치 정의] block in DIRECTION — exceed that ceiling. "This is fine" is failure; "I didn't expect this" is the target.
 3. Stay VERTICALLY within the frame DIRECTION sets. Do not escape to adjacent domains. Go deeper, not wider.
-4. Expand meanings to create appropriate-level final strategies/outputs ({current_batch} items)
+4. Expand meanings to create appropriate-level final strategies/outputs ({refining_count} items)
 5. Call append_result with step="3" and your generated outputs
+6. On your LAST append, pass finalize=true to mark Step 3 as complete.
+   → Step 3 does NOT auto-complete by line count. You must explicitly finalize.
+   → You can append in multiple batches. Only the last one needs finalize=true.
 
-After appending, call run_delusionist again to check completion.
+After finalizing, call run_delusionist to confirm completion.
 """
     
     return "ERROR: Invalid step number"
@@ -287,7 +287,8 @@ Follow the returned instructions, generate sentences, then call append_result.""
 
 Arguments:
 - step: Step number as STRING ("1", "2", or "3")
-- content: Sentences to append (newline separated)""",
+- content: Sentences to append (newline separated)
+- finalize: (Step 3 only) Set to true on the LAST append to signal completion. Step 3 will NOT auto-complete by line count — it waits for this explicit signal.""",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -299,6 +300,11 @@ Arguments:
                     "content": {
                         "type": "string",
                         "description": "Sentences to append (newline separated)"
+                    },
+                    "finalize": {
+                        "type": "boolean",
+                        "description": "Step 3 only: set true on the last append to mark Step 3 as complete",
+                        "default": False
                     }
                 },
                 "required": ["step", "content"]
@@ -379,6 +385,35 @@ Arguments:
                 },
                 "required": ["step"]
             }
+        ),
+        Tool(
+            name="prepare_parallel_gemini_workers",
+            description="""Step 1(Chaining) 병렬 Gemini CLI 워커 준비.
+
+남은 chains를 분할하고 각 워커용 프롬프트를 staging/worker_{id}_prompt.txt에 저장한다.
+Operator(메인 에이전트)가 반환된 cmd를 run_command로 직접 병렬 실행하고,
+응답을 append_result로 올리는 방식 — sub-agent 토큰이 0이 된다.
+
+반환: 워커별 {worker_id, line_count, prompt_path, cmd, batch_start, batch_end} 배열.
+
+두 가지 모드 (batch_size 우선):
+- batch_size: 워커당 줄 수 지정 → 워커 수 자동 계산
+- worker_count: 워커 수 직접 지정 → 줄을 균등 분할
+둘 다 미지정 시 batch_size=25 기본값.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "worker_count": {
+                        "type": "integer",
+                        "description": "병렬 워커 수. batch_size와 동시 지정 시 batch_size 우선."
+                    },
+                    "batch_size": {
+                        "type": "integer",
+                        "description": "워커당 줄 수. 지정 시 워커 수를 자동 계산 (ceil(remaining / batch_size))."
+                    }
+                },
+                "required": []
+            }
         )
     ]
 
@@ -429,37 +464,47 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     elif name == "get_status":
         state = factory.load_state()
         req = factory.load_request()
-        
+
         if not req:
             return [TextContent(type="text", text="ERROR: request.json not found")]
-        
+
         chains_done = factory.count_lines(factory.section_a_path)
         refined_done = factory.count_lines(factory.section_b_path)
         final_done = factory.count_lines(factory.section_c_path)
-        
+        step3_finalized = state.get("step3_finalized", False)
+
+        # Step 3: show finalize status instead of misleading line-count ratio
+        if step3_finalized:
+            step3_display = f"finalized ({final_done} lines)"
+        elif final_done > 0:
+            step3_display = f"{final_done} lines appended (not finalized)"
+        else:
+            step3_display = f"0/{req.get('REFINING_COUNT', 2)}"
+
         status = {
             "current_step": state.get("current_step", 1),
             "progress": {
                 "step1_chains": f"{chains_done}/{req.get('CHAINS_COUNT', 120)}",
                 "step2_refined": f"{refined_done}/{req.get('SELECTION_B_COUNT', 8)}",
-                "step3_final": f"{final_done}/{req.get('REFINING_COUNT', 2)}"
+                "step3_final": step3_display
             },
             "mode": req.get("MODE_SELECTION", "CHAOS"),
             "starting_sentence": req.get("STARTING_SENTENCE", "")
         }
-        
+
         return [TextContent(type="text", text=json.dumps(status, ensure_ascii=False, indent=2))]
     
     elif name == "append_result":
         step_str = arguments.get("step", "")
         content = arguments.get("content", "")
-        
+        finalize = arguments.get("finalize", False)
+
         # Convert string step to int
         try:
             step = int(step_str)
         except (ValueError, TypeError):
             return [TextContent(type="text", text=f"ERROR: Invalid step '{step_str}'. Must be '1', '2', or '3'")]
-        
+
         if step == 1:
             filepath = factory.section_a_path
         elif step == 2:
@@ -468,12 +513,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             filepath = factory.section_c_path
         else:
             return [TextContent(type="text", text=f"ERROR: Invalid step {step}. Must be 1, 2, or 3")]
-        
-        with open(filepath, 'a', encoding='utf-8') as f:
-            f.write(content.strip() + '\n')
-        
+
+        # 파일 잠금으로 병렬 에이전트의 동시 쓰기 방지
+        factory.locked_append(filepath, content)
+
         lines_added = len([l for l in content.strip().split('\n') if l.strip()])
-        return [TextContent(type="text", text=f"SUCCESS: Appended {lines_added} lines to {os.path.basename(filepath)}")]
+        msg = f"SUCCESS: Appended {lines_added} lines to {os.path.basename(filepath)}"
+
+        # Step 3 finalize: set flag in state.json so run_delusionist knows we're done
+        if finalize and step == 3:
+            state = factory.load_state()
+            state["step3_finalized"] = True
+            factory.save_state(state)
+            msg += " | FINALIZED: Step 3 marked as complete."
+
+        return [TextContent(type="text", text=msg)]
     
     elif name == "get_request_config":
         req = factory.load_request()
@@ -483,32 +537,32 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     
     elif name == "update_request_config":
         config = arguments.get("config", {})
-        current = factory.load_request() or {}
-        current.update(config)
-        
-        with open(factory.request_path, 'w', encoding='utf-8') as f:
-            json.dump(current, f, ensure_ascii=False, indent=2)
-        
+        with FileLock(factory.config_lock_path):
+            current = factory.load_request() or {}
+            current.update(config)
+            with open(factory.request_path, 'w', encoding='utf-8') as f:
+                json.dump(current, f, ensure_ascii=False, indent=2)
+
         return [TextContent(type="text", text="SUCCESS: Updated request.json")]
     
     elif name == "reset_factory":
         if not arguments.get("confirm", False):
             return [TextContent(type="text", text="ERROR: confirm must be true to reset")]
-        
+
         # Clear output
         if os.path.exists(factory.output_dir):
             for f in os.listdir(factory.output_dir):
                 filepath = os.path.join(factory.output_dir, f)
                 if os.path.isfile(filepath):
                     os.remove(filepath)
-        
-        # Clear staging
+
+        # Clear staging (state, lock files, prompts)
         if os.path.exists(factory.staging_dir):
             for f in os.listdir(factory.staging_dir):
                 filepath = os.path.join(factory.staging_dir, f)
                 if os.path.isfile(filepath):
                     os.remove(filepath)
-        
+
         return [TextContent(type="text", text="SUCCESS: Factory reset complete")]
     
     elif name == "get_random_words":
@@ -570,6 +624,60 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         
         return [TextContent(type="text", text=content)]
     
+    elif name == "prepare_parallel_step1":
+        batch_size = arguments.get("batch_size")
+        worker_count = arguments.get("worker_count")
+
+        if batch_size is not None and batch_size < 1:
+            return [TextContent(type="text", text="ERROR: batch_size must be >= 1")]
+        if worker_count is not None and worker_count < 1:
+            return [TextContent(type="text", text="ERROR: worker_count must be >= 1")]
+
+        try:
+            batches = factory.prepare_parallel_batches(
+                worker_count=worker_count,
+                batch_size=batch_size,
+            )
+        except RuntimeError as e:
+            return [TextContent(type="text", text=f"ERROR: {e}")]
+
+        if not batches:
+            return [TextContent(type="text", text="Step 1 already complete. Call run_delusionist to advance.")]
+
+        result = {
+            "total_workers": len(batches),
+            "total_lines": sum(b["line_count"] for b in batches),
+            "workers": batches,
+        }
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+    elif name == "prepare_parallel_gemini_workers":
+        batch_size = arguments.get("batch_size")
+        worker_count = arguments.get("worker_count")
+
+        if batch_size is not None and batch_size < 1:
+            return [TextContent(type="text", text="ERROR: batch_size must be >= 1")]
+        if worker_count is not None and worker_count < 1:
+            return [TextContent(type="text", text="ERROR: worker_count must be >= 1")]
+
+        try:
+            workers = factory.prepare_parallel_gemini_workers(
+                worker_count=worker_count,
+                batch_size=batch_size,
+            )
+        except RuntimeError as e:
+            return [TextContent(type="text", text=f"ERROR: {e}")]
+
+        if not workers:
+            return [TextContent(type="text", text="Step 1 already complete. Call run_delusionist to advance.")]
+
+        result = {
+            "total_workers": len(workers),
+            "total_lines": sum(w["line_count"] for w in workers),
+            "workers": workers,
+        }
+        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
     else:
         return [TextContent(type="text", text=f"ERROR: Unknown tool '{name}'")]
 

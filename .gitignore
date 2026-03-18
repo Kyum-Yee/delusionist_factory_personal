@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Output & staging (runtime artifacts)
+output/
+output backup/
+staging/
+
+# Input data (may contain sensitive content)
+input/
+
+# OS
+.DS_Store
+
+# Env
+.env
+.env.local
+config/*.json
+config/*.yaml

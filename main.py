@@ -5,9 +5,28 @@ import json
 import random
 import logging
 import shutil
+import fcntl
 
 # Configure logging to stderr explicitly (avoid polluting stdout for MCP)
 logging.basicConfig(level=logging.INFO, format='[DELUSIONIST] %(message)s', stream=sys.stderr)
+
+
+class FileLock:
+    """프로세스 간 파일 잠금 (fcntl.flock 기반). 병렬 에이전트의 동시 쓰기 방지."""
+
+    def __init__(self, lock_path):
+        self.lock_path = lock_path
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        self.f = open(self.lock_path, 'w')
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *args):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
 
 class DelusionistFactory:
     DEFAULT_STEP1_MODE = "GEMINI_CLI"  # A-step is external by default
@@ -31,6 +50,11 @@ class DelusionistFactory:
         self.section_a_path = os.path.join(self.output_dir, 'section_a_chains.txt')
         self.section_b_path = os.path.join(self.output_dir, 'section_b_refined.txt')
         self.section_c_path = os.path.join(self.output_dir, 'section_c_final.txt')
+
+        # Lock files for concurrent access
+        self.append_lock_path = os.path.join(self.staging_dir, 'append.lock')
+        self.state_lock_path = os.path.join(self.staging_dir, 'state.lock')
+        self.config_lock_path = os.path.join(self.staging_dir, 'config.lock')
 
     def _format_duration(self, seconds: int) -> str:
         seconds = max(0, int(seconds))
@@ -257,26 +281,194 @@ class DelusionistFactory:
         return bool(re.search("[가-힣]", text))
 
     def load_state(self):
-        if not os.path.exists(self.state_path):
-            return {"current_step": 1}
-        try:
-            with open(self.state_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {"current_step": 1}
+        with FileLock(self.state_lock_path):
+            if not os.path.exists(self.state_path):
+                return {"current_step": 1}
+            try:
+                with open(self.state_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                return {"current_step": 1}
 
     def save_state(self, state):
-        with open(self.state_path, 'w', encoding='utf-8') as f:
-            json.dump(state, f, indent=2)
+        with FileLock(self.state_lock_path):
+            with open(self.state_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2)
+
+    def locked_append(self, filepath, content):
+        """파일 잠금 기반 안전한 append. 병렬 에이전트 동시 쓰기 방지."""
+        with FileLock(self.append_lock_path):
+            with open(filepath, 'a', encoding='utf-8') as f:
+                f.write(content.strip() + '\n')
 
     def count_lines(self, filepath):
         if not os.path.exists(filepath):
             return 0
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                return sum(1 for _ in f)
+                # Ignore whitespace-only lines (including indented blank lines).
+                return sum(1 for line in f if line.strip())
         except Exception:
             return 0
+
+    def prepare_parallel_batches(self, worker_count=None, batch_size=None):
+        """
+        Step 1 병렬 실행용 배치 준비.
+
+        두 가지 모드:
+        - worker_count: 워커 수 지정 → 남은 줄을 균등 분할
+        - batch_size: 워커당 줄 수 지정 → 워커 수 자동 계산 (ceil(remaining / batch_size))
+        둘 다 미지정 시 batch_size=25 기본값.
+
+        Returns: list[dict] — 각 워커의 {worker_id, line_count, random_words, context}
+        """
+        req = self.load_request()
+        if not req:
+            raise RuntimeError("request.json not found")
+
+        chains_target = req.get("CHAINS_COUNT", 100)
+        chains_done = self.count_lines(self.section_a_path)
+        remaining = max(0, chains_target - chains_done)
+
+        if remaining == 0:
+            return []
+
+        # batch_size 우선: 워커당 줄 수로 워커 수 역산
+        if batch_size is not None and batch_size >= 1:
+            worker_count = -(-remaining // batch_size)  # ceil(remaining / batch_size)
+        elif worker_count is not None and worker_count >= 1:
+            pass  # worker_count 그대로 사용
+        else:
+            # 둘 다 미지정 → batch_size=25 기본값
+            batch_size = 25
+            worker_count = -(-remaining // batch_size)
+
+        self.word_pool_path, detected_lang = self._resolve_language_and_pool(req)
+
+        # 전체 랜덤 단어 미리 생성
+        all_random_words = [
+            self.get_random_words_from_file(self.word_pool_path, 3)
+            for _ in range(remaining)
+        ]
+
+        # worker_count개로 균등 분할
+        chunk_size = -(-remaining // worker_count)  # ceiling division
+        context = {
+            "direction": req.get("DIRECTION", ""),
+            "starting_sentence": req.get("STARTING_SENTENCE", ""),
+            "mandatory_words": req.get("MANDATORY_WORD", []),
+            "preferred_imagery": req.get("PREFERRED_IMAGERY", []),
+            "language_rule": req.get("LANGUAGE_RULE", "NO_3_CONSECUTIVE_FOREIGN_WORDS"),
+            "mode": req.get("MODE_SELECTION", "CHAOS"),
+        }
+
+        batches = []
+        for i in range(worker_count):
+            start_idx = i * chunk_size
+            end_idx = min(start_idx + chunk_size, remaining)
+            if start_idx >= remaining:
+                break
+            batches.append({
+                "worker_id": i + 1,
+                "line_count": end_idx - start_idx,
+                "random_words": all_random_words[start_idx:end_idx],
+                "context": context,
+            })
+
+        return batches
+
+    def prepare_parallel_gemini_workers(
+        self,
+        worker_count: int | None = None,
+        batch_size: int | None = None,
+    ) -> list[dict]:
+        """
+        Step 1 병렬 Gemini CLI 워커 준비.
+
+        prepare_parallel_batches()와 동일한 분할 로직이지만,
+        각 워커에 대해 staging/worker_{id}_prompt.txt를 생성하고
+        실행할 gemini 명령어(cmd)를 함께 반환한다.
+
+        Operator(메인 에이전트)가 run_command로 gemini를 직접 병렬 실행하고
+        응답을 append_result로 올리면 sub-agent 토큰이 0이 된다.
+
+        Returns:
+            list[dict] — 워커별 {
+                worker_id,
+                line_count,
+                prompt_path,   # staging/worker_{id}_prompt.txt
+                cmd,           # 실행할 gemini 명령어 (문자열)
+                batch_start,   # 이 워커가 담당하는 시작 줄 번호
+                batch_end,     # 이 워커가 담당하는 끝 줄 번호
+            }
+        """
+        batches = self.prepare_parallel_batches(
+            worker_count=worker_count,
+            batch_size=batch_size,
+        )
+        if not batches:
+            return []
+
+        req = self.load_request()
+        if not req:
+            raise RuntimeError("request.json not found")
+
+        direction = req.get("DIRECTION", "")
+        starting = req.get("STARTING_SENTENCE", "")
+        mandatory = req.get("MANDATORY_WORD", [])
+        imagery = req.get("PREFERRED_IMAGERY", [])
+        language_rule = req.get("LANGUAGE_RULE", "NO_3_CONSECUTIVE_FOREIGN_WORDS")
+        model = os.getenv("DELUSIONIST_GEMINI_MODEL", self.DEFAULT_GEMINI_MODEL).strip()
+
+        # chains_done 기준으로 전역 줄 번호 계산
+        chains_done = self.count_lines(self.section_a_path)
+        workers_out = []
+        running_offset = 0  # 이 워커 이전까지 생성된 줄 수의 합
+
+        for batch in batches:
+            wid = batch["worker_id"]
+            wcount = batch["line_count"]
+            batch_start = chains_done + running_offset + 1
+            batch_end = chains_done + running_offset + wcount
+            random_words = batch["random_words"]  # list[list[str]], 길이 == wcount
+
+            prompt = self._build_step1_gemini_prompt(
+                direction=direction,
+                starting=starting,
+                mandatory=mandatory,
+                imagery=imagery,
+                language_rule=language_rule,
+                batch_start=batch_start,
+                batch_random_words=random_words,
+            )
+
+            prompt_path = os.path.join(
+                self.staging_dir, f"worker_{wid}_prompt.txt"
+            )
+            with open(prompt_path, "w", encoding="utf-8") as f:
+                f.write(prompt)
+
+            if model:
+                cmd = (
+                    f'gemini --output-format json --model "{model}" '
+                    f'"$(cat \'{prompt_path}\')"'
+                )
+            else:
+                cmd = f'gemini --output-format json "$(cat \'{prompt_path}\')"'
+
+            workers_out.append(
+                {
+                    "worker_id": wid,
+                    "line_count": wcount,
+                    "prompt_path": prompt_path,
+                    "cmd": cmd,
+                    "batch_start": batch_start,
+                    "batch_end": batch_end,
+                }
+            )
+            running_offset += wcount
+
+        return workers_out
 
     def run(self):
         logging.info("Initializing Delusionist Factory Engine...")
@@ -478,20 +670,16 @@ class DelusionistFactory:
         if state["current_step"] == 3:
             final_done = self.count_lines(self.section_c_path)
             BATCH_SIZE = 5
-            
-            if final_done < refining_count:
-                remaining = refining_count - final_done
-                current_batch = min(BATCH_SIZE, remaining)
-                batch_start = final_done + 1
-                batch_end = final_done + current_batch
 
-                logging.info(f"[STEP 3] Final Progress: {final_done}/{refining_count}")
+            if not state.get("step3_finalized", False):
+                logging.info(f"[STEP 3] Final Progress: {final_done} lines appended (target: {refining_count} entries, not finalized)")
+                current_batch = min(BATCH_SIZE, refining_count)  # advisory batch size
                 
                 # 어휘 수준 분석
                 vocab_hint = self._analyze_vocab_level(direction)
                 
                 print("\n" + "="*70)
-                print(f"  [STEP 3: FINAL CoT] - Final Output #{batch_start}~{batch_end} / {refining_count}")
+                print(f"  [STEP 3: FINAL CoT] - {final_done} lines appended / {refining_count} entries target")
                 print("="*70)
                 print("  ")
                 print("  ## 💡 Core Concept: Objectification — DIRECTION 작성자의 언어로 객관화")
@@ -531,16 +719,19 @@ class DelusionistFactory:
                 print(f"  9. [수직적 깊이] DIRECTION이 설정한 프레임 안에서만 파십시오. 밖으로 나가지 않습니다.")
                 print(f"     → 요청이 'RP 캐릭터 시트'면 RP 캐릭터 시트의 최고봉을 만드십시오 — 갑자기 소설이나 논문을 쓰지 마십시오.")
                 print(f"     → 요청이 '5세 기준'이면 20대 기준을 섞지 마십시오. 해당 프레임 내부의 밀도와 정교함으로 승부하십시오.")
-                print(f"  10. {current_batch}개의 최종 결과물을 생성하십시오.")
+                print(f"  10. {refining_count}개의 최종 결과물을 생성하십시오.")
                 print("  ")
-                print(f"  👉 생성 목표: DIRECTION을 달성하는, 완결성 있는 {current_batch}개의 Masterpiece")
+                print(f"  👉 생성 목표: DIRECTION을 달성하는, 완결성 있는 {refining_count}개의 Masterpiece")
                 print(f"  👉 행동: 결과물을 `{self.section_c_path}` 파일에 정확히 append 하십시오.")
+                print(f"  👉 완료 신호: 모든 결과물을 append한 뒤, 마지막 append_result 호출 시 finalize=true를 전달하십시오.")
+                print(f"     → finalize=true가 전달되어야만 Step 3이 완료 처리됩니다.")
+                print(f"     → 여러 번 나눠서 append해도 됩니다. 마지막 한 번만 finalize=true이면 됩니다.")
                 print("  ")
                 print("="*70 + "\n")
                 return
             
             else:
-                logging.info(f"[STEP 3] ✅ Final Complete! ({final_done} outputs)")
+                logging.info(f"[STEP 3] ✅ Final Complete! (finalized, {final_done} lines)")
                 logging.info("")
                 logging.info("="*50)
                 logging.info("  🎉 DELUSIONIST FACTORY - ALL STEPS COMPLETE!")

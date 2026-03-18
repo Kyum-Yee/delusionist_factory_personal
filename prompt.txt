@@ -19,6 +19,7 @@
 
 작업 내용:
 1. input/request.json 읽기
+1.5. (중요) /Users/jakesmacair/프로젝트 파일/.claude/skills/delusionist/SKILL.md 파일을 반드시 읽고 메모리에 저장한 뒤, 가이드에 따르기.
 2. main.py 실행 → 출력된 Agent 작업 지시 확인
 3. Agent 작업 수행 (망상적 변이 문장 생성)
 4. 결과를 output/ 폴더의 해당 파일에 append
@@ -69,6 +70,24 @@ delusionist_factory/
 | REFINING_COUNT | Step 3 최종 출력 수 | 2 |
 | DIRECTION | 최종 결과물 방향성 (⚠️ 범용적으로 설정할 것 - 아래 원칙 참조) | "Generate innovative..." |
 | FINAL_LANGUAGE | 최종 출력 언어 | "English" 또는 "Korean" |
+
+---
+
+## 🔀 Step 1 병렬 실행 (빠르게 돌리기)
+
+Step 1은 sub-agent를 사용해 병렬로 실행할 수 있다. 순서 무관 — 총 갯수만 맞으면 됨.
+
+```
+1. prepare_parallel_step1 호출 (두 가지 모드, batch_size 우선):
+   - batch_size=25 → 워커당 25줄, 워커 수 자동 계산 (예: 50줄 남음 → 2워커)
+   - worker_count=3 → 3워커, 줄 수 균등 분할
+2. 반환된 워커별 random_words + context를 각 sub-agent에 전달
+3. 각 sub-agent가 문장 생성 후 append_result(step="1") 호출
+4. 실패한 워커 있으면 → get_status로 부족분 확인 → prepare_parallel_step1(worker_count=1)로 재시도
+5. 완료 후 run_delusionist → Step 2 진입
+```
+
+동시 쓰기는 파일 잠금(fcntl.flock)으로 보호됨.
 
 ---
 
