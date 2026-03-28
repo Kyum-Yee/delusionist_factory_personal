@@ -6,6 +6,7 @@ import random
 import logging
 import shutil
 import fcntl
+import shlex
 
 # Configure logging to stderr explicitly (avoid polluting stdout for MCP)
 logging.basicConfig(level=logging.INFO, format='[DELUSIONIST] %(message)s', stream=sys.stderr)
@@ -181,11 +182,11 @@ class DelusionistFactory:
 
         model = os.getenv("DELUSIONIST_GEMINI_MODEL", self.DEFAULT_GEMINI_MODEL).strip()
         if model:
-            cmd = f"gemini --output-format json --model \"{model}\" \"$(cat '{prompt_path}')\""
+            cmd = f"gemini --output-format json --model {shlex.quote(model)} \"$(cat {shlex.quote(prompt_path)})\""
             model_label = model
         else:
             # If Gemini CLI updates its default (e.g. newer preview), this stays future-proof.
-            cmd = f"gemini --output-format json \"$(cat '{prompt_path}')\""
+            cmd = f"gemini --output-format json \"$(cat {shlex.quote(prompt_path)})\""
             model_label = "(gemini CLI default)"
 
         # ETA: best-effort heuristic (configurable via env for your machine/model).
@@ -450,11 +451,11 @@ class DelusionistFactory:
 
             if model:
                 cmd = (
-                    f'gemini --output-format json --model "{model}" '
-                    f'"$(cat \'{prompt_path}\')"'
+                    f'gemini --output-format json --model {shlex.quote(model)} '
+                    f'"$(cat {shlex.quote(prompt_path)})"'
                 )
             else:
-                cmd = f'gemini --output-format json "$(cat \'{prompt_path}\')"'
+                cmd = f'gemini --output-format json "$(cat {shlex.quote(prompt_path)})"'
 
             workers_out.append(
                 {

@@ -220,9 +220,9 @@ After appending, call run_delusionist again to continue.
         if step3_finalized:
             return f"""
 === ALL STEPS COMPLETE ===
-Section A (Chains): {factory_instance.section_a_path}
-Section B (Refined): {factory_instance.section_b_path}
-Section C (Final): {factory_instance.section_c_path}
+Section A (Chains): {os.path.basename(factory_instance.section_a_path)}
+Section B (Refined): {os.path.basename(factory_instance.section_b_path)}
+Section C (Final): {os.path.basename(factory_instance.section_c_path)}
 
 Use read_output_file with step="3" to view final results.
 """
@@ -479,8 +479,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             timeout=60
         )
 
-        output = result.stdout + result.stderr
-        return [TextContent(type="text", text=output if output else "No output from main.py")]
+        if result.returncode != 0:
+            print(f"[run_delusionist] stderr: {result.stderr}", file=sys.stderr)
+            return [TextContent(type="text", text=f"Error running pipeline (exit {result.returncode}). Check server logs.")]
+        output = result.stdout or "No output from main.py"
+        return [TextContent(type="text", text=output)]
     
     elif name == "get_status":
         state = factory.load_state()
@@ -558,6 +561,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     
     elif name == "update_request_config":
         config = arguments.get("config", {})
+        _NUMERIC_LIMITS = {
+            "CHAINS_COUNT": (1, 700),
+            "SELECTION_B_COUNT": (1, 200),
+            "REFINING_COUNT": (1, 200),
+            "STEP1_BATCH_SIZE": (1, 100),
+        }
+        for key, (lo, hi) in _NUMERIC_LIMITS.items():
+            if key in config and isinstance(config[key], (int, float)):
+                config[key] = max(lo, min(hi, int(config[key])))
         with FileLock(factory.config_lock_path):
             current = factory.load_request() or {}
             current.update(config)
@@ -587,7 +599,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text="SUCCESS: Factory reset complete")]
     
     elif name == "get_random_words":
-        count = arguments.get("count", 3)
+        count = min(max(int(arguments.get("count", 3)), 1), 100)
         
         # Determine word pool based on request
         req = factory.load_request()
