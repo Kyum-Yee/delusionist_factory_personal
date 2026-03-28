@@ -37,9 +37,9 @@ WORD_POOL_LINE_COUNTS = {
 def get_word_pool_path(factory_instance: DelusionistFactory, is_korean: bool) -> str:
     """Get word pool file path based on language."""
     if is_korean:
-        return os.path.join(factory_instance.input_dir, 'extracted_words.txt')
+        return os.path.join(factory_instance.base_dir, 'extracted_words.txt')
     else:
-        return os.path.join(factory_instance.input_dir, '100000word.txt')
+        return os.path.join(factory_instance.base_dir, '100000word.txt')
 
 
 def get_line_count(filepath: str) -> int:

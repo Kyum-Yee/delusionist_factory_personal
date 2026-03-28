@@ -84,8 +84,8 @@ class DelusionistFactory:
             is_korean = self._is_korean(content_to_check)
 
         if is_korean:
-            return (os.path.join(self.input_dir, 'extracted_words.txt'), "Korean")
-        return (os.path.join(self.input_dir, '100000word.txt'), "English")
+            return (os.path.join(self.base_dir, 'extracted_words.txt'), "Korean")
+        return (os.path.join(self.base_dir, '100000word.txt'), "English")
 
     def _build_step1_gemini_prompt(
         self,
