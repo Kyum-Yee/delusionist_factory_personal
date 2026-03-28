@@ -252,6 +252,19 @@ async def list_tools() -> list[Tool]:
     """Return list of available tools."""
     return [
         Tool(
+            name="get_request_guide",
+            description="""[CALL THIS FIRST] Get the full REQUEST_GUIDE.md — the complete operations manual for Delusionist Factory.
+
+IMPORTANT: Call this tool BEFORE calling run_delusionist or update_request_config for the first time in a session.
+It explains the 3-step pipeline, all request.json fields, DIRECTION framework, creative design principles, and anti-patterns.
+Without reading this guide, you will misconfigure the factory and produce poor results.""",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        Tool(
             name="run_delusionist",
             description="""Execute Delusionist Factory - Creative delusional sentence generation pipeline.
 
@@ -422,7 +435,15 @@ Operator(메인 에이전트)가 반환된 cmd를 run_command로 직접 병렬 �
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Execute tool."""
     
-    if name == "run_delusionist":
+    if name == "get_request_guide":
+        guide_path = os.path.join(factory.base_dir, "REQUEST_GUIDE.md")
+        if not os.path.exists(guide_path):
+            return [TextContent(type="text", text="ERROR: REQUEST_GUIDE.md not found")]
+        with open(guide_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return [TextContent(type="text", text=content)]
+
+    elif name == "run_delusionist":
         config_update = arguments.get("config_update")
         
         # 1. Update request.json if config_update is provided
